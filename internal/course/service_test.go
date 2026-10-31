@@ -3,10 +3,92 @@ package course_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aksornproject/aksorn-senior-backend-assessment/internal/course"
 )
+
+// memStore is an in-memory attemptStore. Set addErr/listErr to simulate storage failures.
+type memStore struct {
+	attempts []course.Attempt
+	addErr   error
+	listErr  error
+}
+
+func (m *memStore) Add(_ context.Context, a course.Attempt) error {
+	if m.addErr != nil {
+		return m.addErr
+	}
+
+	m.attempts = append(m.attempts, a)
+
+	return nil
+}
+
+func (m *memStore) List(_ context.Context, learnerID, courseID string) ([]course.Attempt, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+
+	out := []course.Attempt{}
+
+	for _, a := range m.attempts {
+		if a.LearnerID == learnerID && a.CourseID == courseID {
+			out = append(out, a)
+		}
+	}
+
+	return out, nil
+}
+
+var attemptSeq atomic.Int64
+
+// hasBest reports whether the lesson has a best score equal to want, without dereferencing nil.
+func hasBest(l course.LessonProgress, want int) bool {
+	return l.BestScore != nil && *l.BestScore == want
+}
+
+func record(t *testing.T, s *course.Service, learner, lesson string, score int) {
+	t.Helper()
+
+	a := course.Attempt{
+		AttemptID: fmt.Sprintf("a-%d", attemptSeq.Add(1)),
+		LearnerID: learner,
+		CourseID:  course.CourseID,
+		LessonID:  lesson,
+		Score:     score,
+	}
+	if err := s.RecordAttempt(context.Background(), a); err != nil {
+		t.Fatalf("RecordAttempt: %v", err)
+	}
+}
+
+func progress(t *testing.T, s *course.Service, learner string) course.Progress {
+	t.Helper()
+
+	p, err := s.Progress(context.Background(), learner, course.CourseID)
+	if err != nil {
+		t.Fatalf("Progress: %v", err)
+	}
+
+	return p
+}
+
+func lessonOf(t *testing.T, p course.Progress, id string) course.LessonProgress {
+	t.Helper()
+
+	for _, l := range p.Lessons {
+		if l.LessonID == id {
+			return l
+		}
+	}
+
+	t.Fatalf("lesson %q missing from %+v", id, p.Lessons)
+
+	return course.LessonProgress{}
+}
 
 func TestRecordAttemptRejectsUnknownLesson(t *testing.T) {
 	// Invalid input is rejected before storage is accessed.
@@ -27,5 +109,221 @@ func TestRecordAttemptRejectsUnknownLesson(t *testing.T) {
 		course.ErrUnknownLesson,
 	) {
 		t.Fatalf("RecordAttempt error = %v, want ErrUnknownLesson", err)
+	}
+}
+
+func TestRecordAttemptStoresAndKeepsMultipleAttempts(t *testing.T) {
+	store := &memStore{}
+	s := course.NewService(store)
+	record(t, s, "l1", "introduction", 40)
+	record(t, s, "l1", "introduction", 80)
+
+	if len(store.attempts) != 2 {
+		t.Fatalf("stored %d attempts, want 2", len(store.attempts))
+	}
+}
+
+func TestRecordAttemptDoesNotStoreInvalid(t *testing.T) {
+	store := &memStore{}
+	s := course.NewService(store)
+
+	cases := map[string]course.Attempt{
+		"blank id":       {AttemptID: " ", LearnerID: "l1", CourseID: course.CourseID, LessonID: "practice", Score: 50},
+		"score too high": {AttemptID: "x", LearnerID: "l1", CourseID: course.CourseID, LessonID: "practice", Score: 101},
+		"score negative": {AttemptID: "x", LearnerID: "l1", CourseID: course.CourseID, LessonID: "practice", Score: -1},
+		"unknown course": {AttemptID: "x", LearnerID: "l1", CourseID: "other", LessonID: "practice", Score: 50},
+	}
+	for name, a := range cases {
+		if err := s.RecordAttempt(context.Background(), a); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+	}
+
+	if len(store.attempts) != 0 {
+		t.Fatalf("invalid attempts were stored: %+v", store.attempts)
+	}
+}
+
+func TestRecordAttemptAcceptsScoreBounds(t *testing.T) {
+	s := course.NewService(&memStore{})
+	record(t, s, "l1", "practice", 0)
+	record(t, s, "l1", "practice", 100)
+}
+
+func TestRecordAttemptPropagatesStoreError(t *testing.T) {
+	boom := errors.New("boom")
+	s := course.NewService(&memStore{addErr: boom})
+	a := course.Attempt{AttemptID: "x", LearnerID: "l1", CourseID: course.CourseID, LessonID: "practice", Score: 50}
+
+	if err := s.RecordAttempt(context.Background(), a); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want boom", err)
+	}
+}
+
+func TestCancelledContext(t *testing.T) {
+	s := course.NewService(&memStore{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	a := course.Attempt{AttemptID: "x", LearnerID: "l1", CourseID: course.CourseID, LessonID: "practice", Score: 50}
+	if err := s.RecordAttempt(ctx, a); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RecordAttempt err = %v", err)
+	}
+
+	if _, err := s.Progress(ctx, "l1", course.CourseID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Progress err = %v", err)
+	}
+}
+
+func TestProgressNoAttempts(t *testing.T) {
+	p := progress(t, course.NewService(&memStore{}), "l1")
+	if len(p.Lessons) != 3 || p.ProgressPercent != 0 || p.Completed {
+		t.Fatalf("unexpected progress: %+v", p)
+	}
+
+	for _, l := range p.Lessons {
+		if l.BestScore != nil || l.Passed {
+			t.Fatalf("lesson %s should be empty: %+v", l.LessonID, l)
+		}
+	}
+}
+
+func TestPassingThresholds(t *testing.T) {
+	cases := []struct {
+		lesson string
+		score  int
+		passed bool
+	}{
+		{"introduction", 59, false}, {"introduction", 60, true},
+		{"practice", 69, false}, {"practice", 70, true},
+		{"challenge", 79, false}, {"challenge", 80, true},
+	}
+	for _, c := range cases {
+		s := course.NewService(&memStore{})
+		record(t, s, "l1", c.lesson, c.score)
+
+		got := lessonOf(t, progress(t, s, "l1"), c.lesson)
+		if got.Passed != c.passed || got.BestScore == nil || *got.BestScore != c.score {
+			t.Errorf("%s score %d: got %+v, want passed=%v", c.lesson, c.score, got, c.passed)
+		}
+	}
+}
+
+func TestZeroScoreIsNotNull(t *testing.T) {
+	s := course.NewService(&memStore{})
+	record(t, s, "l1", "introduction", 0)
+
+	l := lessonOf(t, progress(t, s, "l1"), "introduction")
+	if l.BestScore == nil || *l.BestScore != 0 || l.Passed {
+		t.Fatalf("got %+v", l)
+	}
+}
+
+func TestBestScoreIgnoresInsertionOrder(t *testing.T) {
+	s := course.NewService(&memStore{})
+	record(t, s, "l1", "introduction", 50)
+	record(t, s, "l1", "introduction", 90)
+	record(t, s, "l1", "introduction", 10)
+
+	if got := lessonOf(t, progress(t, s, "l1"), "introduction"); !hasBest(got, 90) {
+		t.Fatalf("got %+v, want best score 90", got)
+	}
+}
+
+func TestLowerLaterScoreKeepsPass(t *testing.T) {
+	s := course.NewService(&memStore{})
+	record(t, s, "l1", "introduction", 60)
+	record(t, s, "l1", "introduction", 0)
+
+	p := progress(t, s, "l1")
+
+	l := lessonOf(t, p, "introduction")
+	if !l.Passed || !hasBest(l, 60) {
+		t.Fatalf("got %+v", l)
+	}
+
+	if p.ProgressPercent != 50 {
+		t.Fatalf("percent = %d, want 50", p.ProgressPercent)
+	}
+}
+
+func TestRequiredVersusOptionalAndCompletion(t *testing.T) {
+	s := course.NewService(&memStore{})
+	record(t, s, "l1", "challenge", 100)
+
+	if p := progress(t, s, "l1"); p.ProgressPercent != 0 || p.Completed {
+		t.Fatalf("optional lesson must not count: %+v", p)
+	}
+
+	record(t, s, "l1", "introduction", 60)
+
+	if p := progress(t, s, "l1"); p.ProgressPercent != 50 || p.Completed {
+		t.Fatalf("one required passed: %+v", p)
+	}
+
+	record(t, s, "l1", "practice", 69)
+
+	if p := progress(t, s, "l1"); p.ProgressPercent != 50 || p.Completed {
+		t.Fatalf("practice just below threshold: %+v", p)
+	}
+
+	record(t, s, "l1", "practice", 70)
+
+	if p := progress(t, s, "l1"); p.ProgressPercent != 100 || !p.Completed {
+		t.Fatalf("both required passed: %+v", p)
+	}
+}
+
+func TestCompletionDoesNotNeedOptionalLesson(t *testing.T) {
+	s := course.NewService(&memStore{})
+	record(t, s, "l1", "introduction", 100)
+	record(t, s, "l1", "practice", 100)
+
+	p := progress(t, s, "l1")
+	if !p.Completed || p.ProgressPercent != 100 {
+		t.Fatalf("got %+v", p)
+	}
+
+	if l := lessonOf(t, p, "challenge"); l.BestScore != nil || l.Passed {
+		t.Fatalf("challenge should be untouched: %+v", l)
+	}
+}
+
+func TestLearnerIsolation(t *testing.T) {
+	s := course.NewService(&memStore{})
+	record(t, s, "l1", "introduction", 100)
+	record(t, s, "l1", "practice", 100)
+
+	p := progress(t, s, "l2")
+	if p.ProgressPercent != 0 || p.Completed || lessonOf(t, p, "introduction").BestScore != nil {
+		t.Fatalf("l2 saw l1 data: %+v", p)
+	}
+
+	if p := progress(t, s, "l1"); !p.Completed {
+		t.Fatalf("l1 should be complete: %+v", p)
+	}
+}
+
+func TestProgressResponseIdentity(t *testing.T) {
+	p := progress(t, course.NewService(&memStore{}), "learner-x")
+	if p.LearnerID != "learner-x" || p.CourseID != course.CourseID {
+		t.Fatalf("got %+v", p)
+	}
+}
+
+func TestProgressErrors(t *testing.T) {
+	boom := errors.New("boom")
+	ctx := context.Background()
+
+	if _, err := course.NewService(&memStore{}).Progress(ctx, " ", course.CourseID); !errors.Is(err, course.ErrInvalidInput) {
+		t.Errorf("blank learner: %v", err)
+	}
+
+	if _, err := course.NewService(&memStore{}).Progress(ctx, "l1", "nope"); !errors.Is(err, course.ErrUnknownCourse) {
+		t.Errorf("unknown course: %v", err)
+	}
+
+	if _, err := course.NewService(&memStore{listErr: boom}).Progress(ctx, "l1", course.CourseID); !errors.Is(err, boom) {
+		t.Errorf("list error: %v", err)
 	}
 }
