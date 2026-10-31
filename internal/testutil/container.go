@@ -23,6 +23,7 @@ type Container struct {
 	t      testing.TB
 	server *httptest.Server
 	repo   *course.Repository
+	cache  *course.RedisCache
 	prefix string
 	seq    atomic.Int64
 }
@@ -57,7 +58,8 @@ func newContainer(t testing.TB, brokenDB bool) *Container {
 	}
 
 	repo := course.NewRepository(conns.Postgres)
-	service := course.NewService(repo)
+	cache := course.NewRedisCache(conns.Redis, time.Minute)
+	service := course.NewService(repo, course.WithProgressCache(cache))
 	server := httptest.NewServer(course.NewHandler(service))
 	prefix := fmt.Sprintf("it-%d-", time.Now().UnixNano())
 
@@ -70,16 +72,24 @@ func newContainer(t testing.TB, brokenDB bool) *Container {
 
 		if !brokenDB {
 			_, _ = conns.Postgres.Exec(context.Background(), "DELETE FROM attempts WHERE learner_id LIKE $1", prefix+"%")
+
+			keys, _ := conns.Redis.Keys(context.Background(), "progress:*:"+prefix+"*").Result()
+			if len(keys) > 0 {
+				conns.Redis.Del(context.Background(), keys...)
+			}
 		}
 
 		conns.Close()
 	})
 
-	return &Container{t: t, server: server, repo: repo, prefix: prefix}
+	return &Container{t: t, server: server, repo: repo, cache: cache, prefix: prefix}
 }
 
 // Repo returns the repository behind the running handler, for checking stored rows.
 func (a *Container) Repo() *course.Repository { return a.repo }
+
+// Cache returns the progress cache behind the running handler.
+func (a *Container) Cache() *course.RedisCache { return a.cache }
 
 // Prefix is prepended to every learner and attempt ID so runs stay independent.
 func (a *Container) Prefix() string { return a.prefix }

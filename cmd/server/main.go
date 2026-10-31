@@ -43,7 +43,10 @@ func run(addr string) error {
 		return err
 	}
 
-	service := course.NewService(course.NewRepository(connections.Postgres))
+	service := course.NewService(
+		course.NewRepository(connections.Postgres),
+		course.WithProgressCache(course.NewRedisCache(connections.Redis, 5*time.Minute)),
+	)
 	server := &http.Server{
 		Handler:           course.NewHandler(service),
 		ReadHeaderTimeout: 5 * time.Second,

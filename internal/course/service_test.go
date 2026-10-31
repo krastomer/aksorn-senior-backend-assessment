@@ -12,9 +12,10 @@ import (
 
 // memStore is an in-memory attemptStore. Set addErr/bestErr to simulate storage failures.
 type memStore struct {
-	attempts []course.Attempt
-	addErr   error
-	bestErr  error
+	attempts  []course.Attempt
+	addErr    error
+	bestErr   error
+	bestCalls int
 }
 
 func (m *memStore) Add(_ context.Context, a course.Attempt) error {
@@ -28,6 +29,8 @@ func (m *memStore) Add(_ context.Context, a course.Attempt) error {
 }
 
 func (m *memStore) BestScores(_ context.Context, learnerID, courseID string) (map[string]int, error) {
+	m.bestCalls++
+
 	if m.bestErr != nil {
 		return nil, m.bestErr
 	}
@@ -329,5 +332,139 @@ func TestProgressErrors(t *testing.T) {
 
 	if _, err := course.NewService(&memStore{bestErr: boom}).Progress(ctx, "l1", course.CourseID); !errors.Is(err, boom) {
 		t.Errorf("list error: %v", err)
+	}
+}
+
+// memCache is an in-memory progressCache. Set the *Err fields to simulate Redis failures.
+type memCache struct {
+	entries                map[string]course.Progress
+	getErr, setErr, delErr error
+}
+
+func newMemCache() *memCache { return &memCache{entries: map[string]course.Progress{}} }
+
+func (c *memCache) Get(_ context.Context, learnerID, courseID string) (course.Progress, bool, error) {
+	if c.getErr != nil {
+		return course.Progress{}, false, c.getErr
+	}
+
+	p, ok := c.entries[learnerID+"/"+courseID]
+
+	return p, ok, nil
+}
+
+func (c *memCache) Set(_ context.Context, learnerID, courseID string, p course.Progress) error {
+	if c.setErr != nil {
+		return c.setErr
+	}
+
+	c.entries[learnerID+"/"+courseID] = p
+
+	return nil
+}
+
+func (c *memCache) Delete(_ context.Context, learnerID, courseID string) error {
+	if c.delErr != nil {
+		return c.delErr
+	}
+
+	delete(c.entries, learnerID+"/"+courseID)
+
+	return nil
+}
+
+func TestProgressIsServedFromCache(t *testing.T) {
+	store, cache := &memStore{}, newMemCache()
+	s := course.NewService(store, course.WithProgressCache(cache))
+	record(t, s, "l1", "introduction", 60)
+
+	first := progress(t, s, "l1")
+	second := progress(t, s, "l1")
+
+	if store.bestCalls != 1 {
+		t.Fatalf("store read %d times, want 1", store.bestCalls)
+	}
+
+	if !hasBest(lessonOf(t, second, "introduction"), 60) || second.ProgressPercent != first.ProgressPercent {
+		t.Fatalf("cached progress differs: %+v vs %+v", first, second)
+	}
+}
+
+func TestRecordAttemptInvalidatesCache(t *testing.T) {
+	store, cache := &memStore{}, newMemCache()
+	s := course.NewService(store, course.WithProgressCache(cache))
+	record(t, s, "l1", "introduction", 40)
+
+	if l := lessonOf(t, progress(t, s, "l1"), "introduction"); !hasBest(l, 40) {
+		t.Fatalf("got %+v", l)
+	}
+
+	record(t, s, "l1", "introduction", 90)
+
+	if l := lessonOf(t, progress(t, s, "l1"), "introduction"); !hasBest(l, 90) || !l.Passed {
+		t.Fatalf("stale progress after new attempt: %+v", l)
+	}
+}
+
+func TestCacheIsPerLearner(t *testing.T) {
+	s := course.NewService(&memStore{}, course.WithProgressCache(newMemCache()))
+	record(t, s, "l1", "introduction", 100)
+	_ = progress(t, s, "l1")
+
+	if l := lessonOf(t, progress(t, s, "l2"), "introduction"); l.BestScore != nil {
+		t.Fatalf("l2 saw l1 cache: %+v", l)
+	}
+}
+
+func TestCacheFailuresFallBackToStore(t *testing.T) {
+	boom := errors.New("redis down")
+	store := &memStore{}
+	cache := &memCache{entries: map[string]course.Progress{}, getErr: boom, setErr: boom, delErr: boom}
+	s := course.NewService(store, course.WithProgressCache(cache))
+
+	// A failing delete must not fail the write, and failing get/set must not fail the read.
+	record(t, s, "l1", "introduction", 70)
+
+	if l := lessonOf(t, progress(t, s, "l1"), "introduction"); !hasBest(l, 70) {
+		t.Fatalf("got %+v", l)
+	}
+
+	progress(t, s, "l1")
+
+	if store.bestCalls != 2 {
+		t.Fatalf("store read %d times, want 2 (no cache help while Redis is down)", store.bestCalls)
+	}
+}
+
+func TestCacheNotUpdatedWhenStoreFails(t *testing.T) {
+	boom := errors.New("boom")
+	cache := newMemCache()
+	s := course.NewService(&memStore{bestErr: boom}, course.WithProgressCache(cache))
+
+	if _, err := s.Progress(context.Background(), "l1", course.CourseID); !errors.Is(err, boom) {
+		t.Fatalf("err = %v", err)
+	}
+
+	if len(cache.entries) != 0 {
+		t.Fatalf("failed read was cached: %+v", cache.entries)
+	}
+}
+
+func TestFailedAddKeepsCache(t *testing.T) {
+	boom := errors.New("boom")
+	store, cache := &memStore{}, newMemCache()
+	s := course.NewService(store, course.WithProgressCache(cache))
+	record(t, s, "l1", "introduction", 40)
+	_ = progress(t, s, "l1")
+
+	store.addErr = boom
+	a := course.Attempt{AttemptID: "x", LearnerID: "l1", CourseID: course.CourseID, LessonID: "introduction", Score: 90}
+
+	if err := s.RecordAttempt(context.Background(), a); !errors.Is(err, boom) {
+		t.Fatalf("err = %v", err)
+	}
+
+	if len(cache.entries) != 1 {
+		t.Fatal("cache was invalidated although nothing was stored")
 	}
 }
