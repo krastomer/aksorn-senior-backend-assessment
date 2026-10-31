@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -343,5 +345,40 @@ func TestRepositoryBestScoresAndList(t *testing.T) {
 
 	if got := storedAttempts(t, ctr, learner); len(got) != 4 || got[0].Score != 40 || got[3].LessonID != "practice" {
 		t.Fatalf("list = %+v", got)
+	}
+}
+
+func TestHTTPErrorsAreJSON(t *testing.T) {
+	ctr := testutil.NewContainer(t)
+
+	for name, c := range map[string]struct {
+		method, path string
+		want         int
+	}{
+		"unknown route":  {http.MethodGet, "/nope", http.StatusNotFound},
+		"wrong method":   {http.MethodGet, "/attempts", http.StatusMethodNotAllowed},
+		"wrong method 2": {http.MethodPost, "/healthz", http.StatusMethodNotAllowed},
+	} {
+		status, body := ctr.Do(c.method, c.path, "", "")
+		if status != c.want || !strings.HasPrefix(body, `{"error":`) {
+			t.Errorf("%s: got %d %q", name, status, body)
+		}
+	}
+}
+
+func TestHTTPPanicReturns500(t *testing.T) {
+	// A nil service panics on first use; the recoverer must turn that into a JSON 500.
+	server := httptest.NewServer(course.NewHandler(nil))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/learners/l1/courses/course-001/progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusInternalServerError || strings.TrimSpace(string(body)) != `{"error":"internal error"}` {
+		t.Fatalf("got %d %s", resp.StatusCode, body)
 	}
 }

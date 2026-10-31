@@ -23,79 +23,136 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+// maxBodyBytes caps a request body so a client cannot make the server buffer arbitrary input.
+const maxBodyBytes = 64 << 10
+
+// Handler serves the course HTTP API on top of a Service.
+type Handler struct {
+	service *Service
+}
+
+// NewHandler builds the router. Cross-cutting concerns are middleware; each route has one method.
 func NewHandler(service *Service) http.Handler {
-	mux := chi.NewRouter()
-	mux.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	h := &Handler{service: service}
+
+	r := chi.NewRouter()
+	r.Use(recoverer)
+	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusNotFound, errorResponse{Error: "not found"})
 	})
-	mux.Post("/attempts", func(w http.ResponseWriter, r *http.Request) {
-		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		if err != nil || mediaType != "application/json" {
-			writeJSON(
-				w,
-				http.StatusUnsupportedMediaType,
-				errorResponse{Error: "use application/json"},
-			)
-			return
-		}
-
-		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-		decoder := json.NewDecoder(r.Body)
-		decoder.DisallowUnknownFields()
-
-		var input attemptRequest
-		if err := decoder.Decode(&input); err != nil {
-			writeDecodeError(w, err)
-			return
-		}
-
-		var extra any
-		if err := decoder.Decode(&extra); err != io.EOF {
-			writeDecodeError(w, err)
-			return
-		}
-
-		if input.Score == nil {
-			writeJSON(
-				w,
-				http.StatusBadRequest,
-				errorResponse{Error: "score is required and must be an integer"},
-			)
-			return
-		}
-
-		attempt := Attempt{
-			AttemptID: input.AttemptID,
-			LearnerID: input.LearnerID,
-			CourseID:  input.CourseID,
-			LessonID:  input.LessonID,
-			Score:     *input.Score,
-		}
-		if err := service.RecordAttempt(r.Context(), attempt); err != nil {
-			writeServiceError(w, err)
-			return
-		}
-
-		writeJSON(w, http.StatusCreated, attempt)
+	r.MethodNotAllowed(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
 	})
-	mux.Get(
-		"/learners/{learner_id}/courses/{course_id}/progress",
-		func(w http.ResponseWriter, r *http.Request) {
-			progress, err := service.Progress(
-				r.Context(),
-				chi.URLParam(r, "learner_id"),
-				chi.URLParam(r, "course_id"),
-			)
-			if err != nil {
-				writeServiceError(w, err)
+
+	r.Get("/healthz", h.health)
+	r.With(requireJSON, limitBody(maxBodyBytes)).Post("/attempts", h.recordAttempt)
+	r.Get("/learners/{learner_id}/courses/{course_id}/progress", h.progress)
+
+	return r
+}
+
+// recoverer turns a panic in any handler into a logged JSON 500 instead of a dropped connection.
+func recoverer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			rec := recover()
+			if rec == nil {
 				return
 			}
 
-			writeJSON(w, http.StatusOK, progress)
-		},
-	)
+			// net/http uses this value to abort a response on purpose; it must keep propagating.
+			if rec == http.ErrAbortHandler {
+				panic(rec)
+			}
 
-	return mux
+			slog.Error("panic while handling request", "panic", rec, "method", r.Method, "path", r.URL.Path)
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "internal error"})
+		}()
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireJSON rejects requests whose Content-Type is not application/json.
+func requireJSON(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != "application/json" {
+			writeJSON(w, http.StatusUnsupportedMediaType, errorResponse{Error: "use application/json"})
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// limitBody makes reads past max bytes fail with *http.MaxBytesError.
+func limitBody(max int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, max)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *Handler) recordAttempt(w http.ResponseWriter, r *http.Request) {
+	attempt, ok := decodeAttempt(w, r)
+	if !ok {
+		return
+	}
+
+	if err := h.service.RecordAttempt(r.Context(), attempt); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, attempt)
+}
+
+func (h *Handler) progress(w http.ResponseWriter, r *http.Request) {
+	progress, err := h.service.Progress(r.Context(), chi.URLParam(r, "learner_id"), chi.URLParam(r, "course_id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, progress)
+}
+
+// decodeAttempt reads exactly one JSON object. On failure it writes the response and returns false.
+func decodeAttempt(w http.ResponseWriter, r *http.Request) (Attempt, bool) {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	var input attemptRequest
+	if err := decoder.Decode(&input); err != nil {
+		writeDecodeError(w, err)
+		return Attempt{}, false
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		writeDecodeError(w, err)
+		return Attempt{}, false
+	}
+
+	if input.Score == nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "score is required and must be an integer"})
+		return Attempt{}, false
+	}
+
+	return Attempt{
+		AttemptID: input.AttemptID,
+		LearnerID: input.LearnerID,
+		CourseID:  input.CourseID,
+		LessonID:  input.LessonID,
+		Score:     *input.Score,
+	}, true
 }
 
 func writeDecodeError(w http.ResponseWriter, err error) {
