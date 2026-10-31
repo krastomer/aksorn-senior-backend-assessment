@@ -41,6 +41,8 @@ List any limitations or unfinished work, and what you would verify before produc
 - `Progress` loads every attempt of a learner on each call, so cost grows with history.
 - Integration tests need PostgreSQL and Redis running.
 
+**Beyond the required scope:** I implemented the improvements described above on a separate branch, `feat/improvements`, so `main` stays within the assignment. It adds: a unique `attempt_id` with `ON CONFLICT` and 409 on conflicting replays; best scores computed in SQL (`MAX ... GROUP BY`) with a covering index; a Redis progress cache that is deleted after each write and expires by TTL; and handler/middleware, request ID and access-log changes. A cache read racing a write can serve a stale value until the TTL expires. That branch is not part of the reviewed submission.
+
 **Verify before production**
 - Query plan with `EXPLAIN` on realistic data volumes, and a load test of `Progress`.
 - Same-ID retries running simultaneously against a real database, after adding the unique constraint.
