@@ -21,7 +21,8 @@ func NewHandler(service *Service) http.Handler {
 	h := &Handler{service: service}
 
 	r := chi.NewRouter()
-	r.Use(recoverer)
+	// recoverer sits innermost so accessLog still records the 500 it writes.
+	r.Use(requestID, accessLog, recoverer)
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "not found"})
 	})

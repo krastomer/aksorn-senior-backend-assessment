@@ -1,8 +1,10 @@
 package course_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -84,4 +86,93 @@ func TestRecovererLeavesAbortHandlerPanicAlone(t *testing.T) {
 
 	serve(h, http.MethodGet, "/learners/l1/courses/course-001/progress", "")
 	t.Fatal("expected panic to propagate")
+}
+
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	var buf bytes.Buffer
+
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	return &buf
+}
+
+func requestWithID(h http.Handler, id string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	if id != "" {
+		req.Header.Set("X-Request-Id", id)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	return rec
+}
+
+func TestRequestIDIsGeneratedWhenMissing(t *testing.T) {
+	h := course.NewHandler(course.NewService(&memStore{}))
+
+	first := requestWithID(h, "").Header().Get("X-Request-Id")
+	second := requestWithID(h, "").Header().Get("X-Request-Id")
+
+	if first == "" || first == second {
+		t.Fatalf("ids = %q, %q; want distinct non-empty values", first, second)
+	}
+}
+
+func TestRequestIDKeepsValidCallerValue(t *testing.T) {
+	h := course.NewHandler(course.NewService(&memStore{}))
+
+	if got := requestWithID(h, "trace-1.a_B").Header().Get("X-Request-Id"); got != "trace-1.a_B" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestRequestIDReplacesUnsafeCallerValue(t *testing.T) {
+	h := course.NewHandler(course.NewService(&memStore{}))
+
+	for _, bad := range []string{"has space", "semi;colon", "quote\"", strings.Repeat("a", 65)} {
+		if got := requestWithID(h, bad).Header().Get("X-Request-Id"); got == bad || got == "" {
+			t.Errorf("unsafe id %q was kept or dropped: %q", bad, got)
+		}
+	}
+}
+
+func TestAccessLogRecordsRequest(t *testing.T) {
+	logs := captureLogs(t)
+	h := course.NewHandler(course.NewService(&memStore{}))
+
+	req := httptest.NewRequest(http.MethodGet, "/nope", nil)
+	req.Header.Set("X-Request-Id", "abc-123")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	for _, want := range []string{"request_id=abc-123", "method=GET", "path=/nope", "status=404"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log missing %q: %s", want, logs)
+		}
+	}
+}
+
+func TestAccessLogAndPanicLogShareRequestID(t *testing.T) {
+	logs := captureLogs(t)
+	h := course.NewHandler(course.NewService(&panicStore{}))
+
+	req := httptest.NewRequest(http.MethodGet, "/learners/l1/courses/course-001/progress", nil)
+	req.Header.Set("X-Request-Id", "boom-1")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	out := logs.String()
+	if strings.Count(out, "request_id=boom-1") != 2 || !strings.Contains(out, "status=500") {
+		t.Fatalf("want panic log and access log (status 500) with the same id:\n%s", out)
+	}
+}
+
+// panicStore panics with an ordinary value, which the recoverer must handle.
+type panicStore struct{ memStore }
+
+func (panicStore) BestScores(context.Context, string, string) (map[string]int, error) {
+	panic("boom")
 }
