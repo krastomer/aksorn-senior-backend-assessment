@@ -18,6 +18,9 @@ import (
 )
 
 func main() {
+	// JSON on stderr: stdout is reserved for the LISTEN_ADDR line that tooling reads.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+
 	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
 
 	flag.Parse()

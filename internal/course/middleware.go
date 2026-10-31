@@ -1,8 +1,10 @@
 package course
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"io"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -52,10 +54,45 @@ func requestID(next http.Handler) http.Handler {
 	})
 }
 
-// statusRecorder remembers the status code a handler wrote.
+// maxLoggedBody caps how much of each body is copied into a log line.
+const maxLoggedBody = 2 << 10
+
+// bodyCapture keeps the first maxLoggedBody bytes written to it and notes if more was dropped.
+type bodyCapture struct {
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (c *bodyCapture) Write(p []byte) (int, error) {
+	room := maxLoggedBody - c.buf.Len()
+
+	switch {
+	case len(p) <= room:
+		c.buf.Write(p)
+	case room > 0:
+		c.buf.Write(p[:room])
+
+		c.truncated = true
+	default:
+		c.truncated = true
+	}
+
+	return len(p), nil
+}
+
+func (c *bodyCapture) String() string {
+	if c.truncated {
+		return c.buf.String() + "...(truncated)"
+	}
+
+	return c.buf.String()
+}
+
+// statusRecorder remembers the status code and body a handler wrote.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+	body   bodyCapture
 }
 
 func (s *statusRecorder) WriteHeader(status int) {
@@ -63,11 +100,29 @@ func (s *statusRecorder) WriteHeader(status int) {
 	s.ResponseWriter.WriteHeader(status)
 }
 
-// accessLog logs one line per request after it finishes.
+func (s *statusRecorder) Write(p []byte) (int, error) {
+	n, err := s.ResponseWriter.Write(p)
+	_, _ = s.body.Write(p[:n])
+
+	return n, err
+}
+
+// teeBody copies bytes into capture as the handler reads them, so reading behavior is unchanged.
+type teeBody struct {
+	io.Reader
+	io.Closer
+}
+
+// accessLog logs one line per request after it finishes, including the first bytes of both bodies.
+// Only bytes the handler actually read are logged, so a request rejected before reading shows an empty body.
 func accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
+		var requestBody bodyCapture
+
+		r.Body = teeBody{Reader: io.TeeReader(r.Body, &requestBody), Closer: r.Body}
 
 		next.ServeHTTP(rec, r)
 
@@ -77,6 +132,8 @@ func accessLog(next http.Handler) http.Handler {
 			"path", r.URL.Path,
 			"status", rec.status,
 			"duration", time.Since(start),
+			"request_body", requestBody.String(),
+			"response_body", rec.body.String(),
 		)
 	})
 }
