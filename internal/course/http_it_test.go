@@ -1,6 +1,7 @@
 package course_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -216,5 +217,131 @@ func TestHTTPSimultaneousAttemptsKeepHigherScore(t *testing.T) {
 		if l := lessonOf(t, ctr.Progress(learner), "introduction"); !hasBest(l, 90) {
 			t.Fatalf("round %d: got %+v, want best score 90", round, l)
 		}
+	}
+}
+
+func storedAttempts(t *testing.T, ctr *testutil.Container, learner string) []course.Attempt {
+	t.Helper()
+
+	attempts, err := ctr.Repo().List(context.Background(), learner, course.CourseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return attempts
+}
+
+func TestHTTPIdenticalReplayStoresOnce(t *testing.T) {
+	ctr := testutil.NewContainer(t)
+	learner := ctr.Learner("replay")
+
+	for range 3 {
+		if status, body := ctr.PostWithID("same", learner, "introduction", "60"); status != http.StatusCreated {
+			t.Fatalf("replay = %d %s", status, body)
+		}
+	}
+
+	if got := storedAttempts(t, ctr, learner); len(got) != 1 {
+		t.Fatalf("stored %d rows, want 1: %+v", len(got), got)
+	}
+}
+
+func TestHTTPSameIDWithDifferentContentConflicts(t *testing.T) {
+	ctr := testutil.NewContainer(t)
+	learner := ctr.Learner("conflict")
+
+	if status, body := ctr.PostWithID("same", learner, "introduction", "60"); status != http.StatusCreated {
+		t.Fatalf("first = %d %s", status, body)
+	}
+
+	for name, c := range map[string]struct{ learner, lesson, score string }{
+		"score":   {learner, "introduction", "90"},
+		"lesson":  {learner, "practice", "60"},
+		"learner": {ctr.Learner("other"), "introduction", "60"},
+	} {
+		if status, body := ctr.PostWithID("same", c.learner, c.lesson, c.score); status != http.StatusConflict {
+			t.Errorf("different %s = %d %s, want 409", name, status, body)
+		}
+	}
+
+	got := storedAttempts(t, ctr, learner)
+	if len(got) != 1 || got[0].Score != 60 || got[0].LessonID != "introduction" {
+		t.Fatalf("data changed: %+v", got)
+	}
+
+	if len(storedAttempts(t, ctr, ctr.Learner("other"))) != 0 {
+		t.Fatal("conflicting attempt was stored for another learner")
+	}
+}
+
+func TestHTTPSimultaneousSameIDStoresOnce(t *testing.T) {
+	ctr := testutil.NewContainer(t)
+
+	for round := range 10 {
+		learner := ctr.Learner(fmt.Sprintf("dup-%d", round))
+		id := fmt.Sprintf("dup-%d", round)
+		scores := []string{"60", "60", "60", "90", "90"} // three identical, two conflicting
+		statuses := make([]int, len(scores))
+
+		var wg sync.WaitGroup
+
+		for i, score := range scores {
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+
+				statuses[i], _ = ctr.PostWithID(id, learner, "introduction", score)
+			}()
+		}
+
+		wg.Wait()
+
+		got := storedAttempts(t, ctr, learner)
+		if len(got) != 1 {
+			t.Fatalf("round %d: stored %d rows, want 1", round, len(got))
+		}
+
+		// Whichever request won decides which content is the original; the rest must match 201 or 409.
+		for i, status := range statuses {
+			want := http.StatusConflict
+			if fmt.Sprint(got[0].Score) == scores[i] {
+				want = http.StatusCreated
+			}
+
+			if status != want {
+				t.Fatalf("round %d: score %s = %d, want %d (stored %d)", round, scores[i], status, want, got[0].Score)
+			}
+		}
+	}
+}
+
+func TestRepositoryBestScoresAndList(t *testing.T) {
+	ctr := testutil.NewContainer(t)
+	learner := ctr.Learner("repo")
+	ctx := context.Background()
+
+	best, err := ctr.Repo().BestScores(ctx, learner, course.CourseID)
+	if err != nil || len(best) != 0 {
+		t.Fatalf("empty = %v, %v", best, err)
+	}
+
+	ctr.MustPost(learner, "introduction", 40)
+	ctr.MustPost(learner, "introduction", 80)
+	ctr.MustPost(learner, "introduction", 10)
+	ctr.MustPost(learner, "practice", 0)
+	ctr.MustPost(ctr.Learner("repo-other"), "practice", 100)
+
+	best, err = ctr.Repo().BestScores(ctx, learner, course.CourseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(best) != 2 || best["introduction"] != 80 || best["practice"] != 0 {
+		t.Fatalf("best = %v", best)
+	}
+
+	if got := storedAttempts(t, ctr, learner); len(got) != 4 || got[0].Score != 40 || got[3].LessonID != "practice" {
+		t.Fatalf("list = %+v", got)
 	}
 }

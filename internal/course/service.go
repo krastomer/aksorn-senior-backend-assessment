@@ -7,7 +7,7 @@ import (
 
 type attemptStore interface {
 	Add(ctx context.Context, attempt Attempt) error
-	List(ctx context.Context, learnerID, courseID string) ([]Attempt, error)
+	BestScores(ctx context.Context, learnerID, courseID string) (map[string]int, error)
 }
 
 type Service struct {
@@ -43,17 +43,9 @@ func (s *Service) Progress(ctx context.Context, learnerID, courseID string) (Pro
 		return Progress{}, ErrUnknownCourse
 	}
 
-	attempts, err := s.repo.List(ctx, learnerID, courseID)
+	best, err := s.repo.BestScores(ctx, learnerID, courseID)
 	if err != nil {
 		return Progress{}, err
-	}
-
-	best := map[string]int{}
-
-	for _, a := range attempts {
-		if cur, ok := best[a.LessonID]; !ok || a.Score > cur {
-			best[a.LessonID] = a.Score
-		}
 	}
 
 	course := FixedCourse()

@@ -10,11 +10,11 @@ import (
 	"github.com/aksornproject/aksorn-senior-backend-assessment/internal/course"
 )
 
-// memStore is an in-memory attemptStore. Set addErr/listErr to simulate storage failures.
+// memStore is an in-memory attemptStore. Set addErr/bestErr to simulate storage failures.
 type memStore struct {
 	attempts []course.Attempt
 	addErr   error
-	listErr  error
+	bestErr  error
 }
 
 func (m *memStore) Add(_ context.Context, a course.Attempt) error {
@@ -27,20 +27,24 @@ func (m *memStore) Add(_ context.Context, a course.Attempt) error {
 	return nil
 }
 
-func (m *memStore) List(_ context.Context, learnerID, courseID string) ([]course.Attempt, error) {
-	if m.listErr != nil {
-		return nil, m.listErr
+func (m *memStore) BestScores(_ context.Context, learnerID, courseID string) (map[string]int, error) {
+	if m.bestErr != nil {
+		return nil, m.bestErr
 	}
 
-	out := []course.Attempt{}
+	best := map[string]int{}
 
 	for _, a := range m.attempts {
-		if a.LearnerID == learnerID && a.CourseID == courseID {
-			out = append(out, a)
+		if a.LearnerID != learnerID || a.CourseID != courseID {
+			continue
+		}
+
+		if cur, ok := best[a.LessonID]; !ok || a.Score > cur {
+			best[a.LessonID] = a.Score
 		}
 	}
 
-	return out, nil
+	return best, nil
 }
 
 var attemptSeq atomic.Int64
@@ -323,7 +327,7 @@ func TestProgressErrors(t *testing.T) {
 		t.Errorf("unknown course: %v", err)
 	}
 
-	if _, err := course.NewService(&memStore{listErr: boom}).Progress(ctx, "l1", course.CourseID); !errors.Is(err, boom) {
+	if _, err := course.NewService(&memStore{bestErr: boom}).Progress(ctx, "l1", course.CourseID); !errors.Is(err, boom) {
 		t.Errorf("list error: %v", err)
 	}
 }

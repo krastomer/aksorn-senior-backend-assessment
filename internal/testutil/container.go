@@ -22,6 +22,7 @@ import (
 type Container struct {
 	t      testing.TB
 	server *httptest.Server
+	repo   *course.Repository
 	prefix string
 	seq    atomic.Int64
 }
@@ -55,7 +56,8 @@ func newContainer(t testing.TB, brokenDB bool) *Container {
 		t.Fatalf("integration test needs PostgreSQL and Redis (run make infra-up, or set SKIP_INTEGRATION=1): %v", err)
 	}
 
-	service := course.NewService(course.NewRepository(conns.Postgres))
+	repo := course.NewRepository(conns.Postgres)
+	service := course.NewService(repo)
 	server := httptest.NewServer(course.NewHandler(service))
 	prefix := fmt.Sprintf("it-%d-", time.Now().UnixNano())
 
@@ -73,8 +75,11 @@ func newContainer(t testing.TB, brokenDB bool) *Container {
 		conns.Close()
 	})
 
-	return &Container{t: t, server: server, prefix: prefix}
+	return &Container{t: t, server: server, repo: repo, prefix: prefix}
 }
+
+// Repo returns the repository behind the running handler, for checking stored rows.
+func (a *Container) Repo() *course.Repository { return a.repo }
 
 // Prefix is prepended to every learner and attempt ID so runs stay independent.
 func (a *Container) Prefix() string { return a.prefix }
@@ -113,10 +118,16 @@ func (a *Container) Do(method, path, contentType, body string) (int, string) {
 func (a *Container) Post(learner, lesson, score string) (int, string) {
 	a.t.Helper()
 
-	seq := a.seq.Add(1)
+	return a.PostWithID(fmt.Sprintf("a%d", a.seq.Add(1)), learner, lesson, score)
+}
+
+// PostWithID sends an attempt with the given attempt_id (prefixed to stay unique per run) and raw score JSON.
+func (a *Container) PostWithID(attemptID, learner, lesson, score string) (int, string) {
+	a.t.Helper()
+
 	body := fmt.Sprintf(
-		`{"attempt_id":"%sa%d","learner_id":"%s","course_id":"course-001","lesson_id":"%s","score":%s}`,
-		a.prefix, seq, learner, lesson, score,
+		`{"attempt_id":"%s%s","learner_id":"%s","course_id":"course-001","lesson_id":"%s","score":%s}`,
+		a.prefix, attemptID, learner, lesson, score,
 	)
 
 	return a.Do(http.MethodPost, "/attempts", "application/json", body)
