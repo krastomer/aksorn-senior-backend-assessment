@@ -188,6 +188,24 @@ func TestHTTPStorageFailureReturns500(t *testing.T) {
 	}
 }
 
+func TestRepositoryReturnsErrorsWhenStorageIsDown(t *testing.T) {
+	repo := testutil.NewBrokenContainer(t).Repo()
+	ctx := context.Background()
+
+	if _, err := repo.List(ctx, "l1", course.CourseID); err == nil {
+		t.Error("List: expected error")
+	}
+
+	if _, err := repo.BestScores(ctx, "l1", course.CourseID); err == nil {
+		t.Error("BestScores: expected error")
+	}
+
+	a := course.Attempt{AttemptID: "x", LearnerID: "l1", CourseID: course.CourseID, LessonID: "practice", Score: 1}
+	if err := repo.Add(ctx, a); err == nil {
+		t.Error("Add: expected error")
+	}
+}
+
 func TestHTTPSimultaneousAttemptsKeepHigherScore(t *testing.T) {
 	ctr := testutil.NewContainer(t)
 

@@ -143,3 +143,34 @@ func TestProgressWorksWhenRedisIsDown(t *testing.T) {
 		t.Fatalf("got %+v", l)
 	}
 }
+
+func TestCorruptCacheEntryFallsBackToPostgres(t *testing.T) {
+	ctr := testutil.NewContainer(t)
+	learner := ctr.Learner("corrupt")
+	ctx := context.Background()
+
+	conns, err := infra.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(conns.Close)
+
+	ctr.MustPost(learner, "introduction", 65)
+
+	if err := conns.Redis.Set(ctx, "progress:"+course.CourseID+":"+learner, "not json", time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok, err := ctr.Cache().Get(ctx, learner, course.CourseID); ok || err == nil {
+		t.Fatalf("corrupt entry = %v, %v; want a decode error", ok, err)
+	}
+
+	// The read still succeeds from PostgreSQL and replaces the bad entry.
+	if l := lessonOf(t, ctr.Progress(learner), "introduction"); !hasBest(l, 65) {
+		t.Fatalf("got %+v", l)
+	}
+
+	if _, ok, err := ctr.Cache().Get(ctx, learner, course.CourseID); !ok || err != nil {
+		t.Fatalf("entry not rebuilt: %v, %v", ok, err)
+	}
+}
