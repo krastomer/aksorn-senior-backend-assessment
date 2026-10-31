@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,13 +23,26 @@ type Container struct {
 	t      testing.TB
 	server *httptest.Server
 	prefix string
-	seq    int
+	seq    atomic.Int64
 }
 
 // NewContainer starts the handler and removes the data it created when the test ends.
 // The test fails when PostgreSQL or Redis is unreachable (run make infra-up);
 // set SKIP_INTEGRATION=1 to skip instead.
 func NewContainer(t testing.TB) *Container {
+	t.Helper()
+
+	return newContainer(t, false)
+}
+
+// NewBrokenContainer starts the handler on a closed PostgreSQL pool, so every storage call fails.
+func NewBrokenContainer(t testing.TB) *Container {
+	t.Helper()
+
+	return newContainer(t, true)
+}
+
+func newContainer(t testing.TB, brokenDB bool) *Container {
 	t.Helper()
 
 	conns, err := infra.Open(context.Background())
@@ -45,9 +59,17 @@ func NewContainer(t testing.TB) *Container {
 	server := httptest.NewServer(course.NewHandler(service))
 	prefix := fmt.Sprintf("it-%d-", time.Now().UnixNano())
 
+	if brokenDB {
+		conns.Postgres.Close()
+	}
+
 	t.Cleanup(func() {
 		server.Close()
-		_, _ = conns.Postgres.Exec(context.Background(), "DELETE FROM attempts WHERE learner_id LIKE $1", prefix+"%")
+
+		if !brokenDB {
+			_, _ = conns.Postgres.Exec(context.Background(), "DELETE FROM attempts WHERE learner_id LIKE $1", prefix+"%")
+		}
+
 		conns.Close()
 	})
 
@@ -91,10 +113,10 @@ func (a *Container) Do(method, path, contentType, body string) (int, string) {
 func (a *Container) Post(learner, lesson, score string) (int, string) {
 	a.t.Helper()
 
-	a.seq++
+	seq := a.seq.Add(1)
 	body := fmt.Sprintf(
 		`{"attempt_id":"%sa%d","learner_id":"%s","course_id":"course-001","lesson_id":"%s","score":%s}`,
-		a.prefix, a.seq, learner, lesson, score,
+		a.prefix, seq, learner, lesson, score,
 	)
 
 	return a.Do(http.MethodPost, "/attempts", "application/json", body)

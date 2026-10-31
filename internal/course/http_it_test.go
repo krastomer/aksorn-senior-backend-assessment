@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aksornproject/aksorn-senior-backend-assessment/internal/course"
@@ -166,5 +167,54 @@ func TestHTTPRoutingErrors(t *testing.T) {
 
 	if status, _ := ctr.Do(http.MethodGet, "/attempts", "", ""); status != http.StatusMethodNotAllowed {
 		t.Errorf("GET /attempts = %d", status)
+	}
+}
+
+func TestHTTPStorageFailureReturns500(t *testing.T) {
+	ctr := testutil.NewBrokenContainer(t)
+	learner := ctr.Learner("down")
+
+	status, body := ctr.Post(learner, "introduction", "60")
+	if status != http.StatusInternalServerError || strings.TrimSpace(body) != `{"error":"internal error"}` {
+		t.Errorf("POST /attempts = %d %s", status, body)
+	}
+
+	status, body = ctr.Do(http.MethodGet, "/learners/"+learner+"/courses/course-001/progress", "", "")
+	if status != http.StatusInternalServerError || strings.TrimSpace(body) != `{"error":"internal error"}` {
+		t.Errorf("GET progress = %d %s", status, body)
+	}
+}
+
+func TestHTTPSimultaneousAttemptsKeepHigherScore(t *testing.T) {
+	ctr := testutil.NewContainer(t)
+
+	for round := range 20 {
+		learner := ctr.Learner(fmt.Sprintf("race-%d", round))
+		scores := []int{90, 70}
+		statuses := make([]int, len(scores))
+
+		var wg sync.WaitGroup
+
+		for i, score := range scores {
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+
+				statuses[i], _ = ctr.Post(learner, "introduction", fmt.Sprint(score))
+			}()
+		}
+
+		wg.Wait()
+
+		for i, status := range statuses {
+			if status != http.StatusCreated {
+				t.Fatalf("round %d: POST score %d = %d", round, scores[i], status)
+			}
+		}
+
+		if l := lessonOf(t, ctr.Progress(learner), "introduction"); !hasBest(l, 90) {
+			t.Fatalf("round %d: got %+v, want best score 90", round, l)
+		}
 	}
 }
